@@ -8,7 +8,8 @@ const odooRouter = require("./routes/odoo");
 // CORS Configuration (updated for frontend on 3001)
 app.use(
   cors({
-    origin: "http://localhost:3001",
+    origin: "https://nezarabouhamdan.github.io",
+
     methods: "GET,POST",
     credentials: true,
     allowedHeaders: "Content-Type,Authorization",
