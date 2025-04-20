@@ -8,14 +8,16 @@ const odooRouter = require("./routes/odoo");
 // CORS Configuration (updated with multiple allowed origins)
 app.use(
   cors({
-    origin:"https://www.kahles.ae",  // Added domain
-    
-    methods: "GET,POST",
-    credentials: true,
-    allowedHeaders: "Content-Type,Authorization",
+    origin: [
+      "https://www.kahles.ae",
+      "https://kahles.ae" // Add non-www version
+    ],
+    methods: ["GET", "POST", "OPTIONS"], // Add OPTIONS for preflight
+    allowedHeaders: ["Content-Type", "Authorization"], // Array format
+    credentials: true
   })
 );
-
+app.options('*', cors());
 app.use(express.json());
 
 // Routes
