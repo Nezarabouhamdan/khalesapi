@@ -5,19 +5,23 @@ require("dotenv").config();
 const app = express();
 const odooRouter = require("./routes/odoo");
 
-// CORS Configuration (updated with multiple allowed origins)
+// CORS Configuration - Fix these issues:
+// 1. Remove standalone app.use(cors) line
+// 2. Add explicit OPTIONS handling
+// 3. Maintain proper middleware order
+
 app.use(
   cors({
-    origin: [
-      "https://www.kahles.ae",
-      "https://kahles.ae", // Add non-www version
-    ],
-    methods: ["GET", "POST", "OPTIONS"], // Add OPTIONS for preflight
-    allowedHeaders: ["Content-Type", "Authorization"], // Array format
-    credentials: true,
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false,
   })
 );
-app.use(cors());
+
+// Handle preflight requests globally
+app.options("*", cors());
+
 app.use(express.json());
 
 // Routes
