@@ -10,14 +10,14 @@ app.use(
   cors({
     origin: [
       "https://www.kahles.ae",
-      "https://kahles.ae" // Add non-www version
+      "https://kahles.ae", // Add non-www version
     ],
     methods: ["GET", "POST", "OPTIONS"], // Add OPTIONS for preflight
     allowedHeaders: ["Content-Type", "Authorization"], // Array format
-    credentials: true
+    credentials: true,
   })
 );
-app.options('*', cors());
+app.use(cors());
 app.use(express.json());
 
 // Routes
