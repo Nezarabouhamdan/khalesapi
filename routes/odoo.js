@@ -15,7 +15,6 @@ const commonClient = xmlrpc.createClient({
 const objectClient = xmlrpc.createClient({
   url: `${ODOO_URL}/xmlrpc/2/object`,
 });
-
 function formatOdooDateTime(date) {
   return date.toISOString().replace(/T/, " ").replace(/\..+/, "");
 }
@@ -33,6 +32,7 @@ async function authenticate() {
   });
 }
 
+// ... (Keep existing Odoo configuration and helper functions) ...
 async function verifyPartnersExist(uid, partnerIds) {
   return new Promise((resolve, reject) => {
     objectClient.methodCall(
@@ -43,7 +43,7 @@ async function verifyPartnersExist(uid, partnerIds) {
         ODOO_PASSWORD,
         "res.partner",
         "search_count",
-        [[[["id", "in", partnerIds]]]],
+        [[["id", "in", partnerIds]]],
       ],
       (err, count) => {
         if (err) reject(err);
@@ -55,19 +55,7 @@ async function verifyPartnersExist(uid, partnerIds) {
     );
   });
 }
-
-const DEFAULT_PARTNER_IDS = [9, 23, 1041, 1035];
-
-// Helper: search for a record id
-async function searchUid(model, domain) {
-  return new Promise((resolve, reject) => {
-    objectClient.methodCall(
-      "execute_kw",
-      [ODOO_DB, null, ODOO_PASSWORD, model, "search", [domain]],
-      (err, ids) => (err ? reject(err) : resolve(ids))
-    );
-  });
-}
+const DEFAULT_PARTNER_IDS = [9, 23, 1041, 1035]; // Reuse the same partner IDs
 
 router.post("/create-lead", async (req, res) => {
   try {
@@ -81,8 +69,6 @@ router.post("/create-lead", async (req, res) => {
         error: "Missing required fields (name, phone, email)",
       });
     }
-
-    // Verify partners exist
     try {
       await verifyPartnersExist(uid, DEFAULT_PARTNER_IDS);
     } catch (error) {
@@ -91,11 +77,11 @@ router.post("/create-lead", async (req, res) => {
         error: "Invalid partner configuration",
       });
     }
-
-    // Ensure utm.source record
     let sourceId;
+
     try {
-      const existing = await new Promise((resolve, reject) => {
+      // Correct domain structure
+      const existingSources = await new Promise((resolve, reject) => {
         objectClient.methodCall(
           "execute_kw",
           [
@@ -104,13 +90,14 @@ router.post("/create-lead", async (req, res) => {
             ODOO_PASSWORD,
             "utm.source",
             "search",
-            [[[["name", "=", "Website"]]]],
+            [[["name", "=", "Website"]]], // Fixed domain format
           ],
-          (err, ids) => (err ? reject(err) : resolve(ids))
+          (err, value) => (err ? reject(err) : resolve(value))
         );
       });
-      if (existing.length) {
-        sourceId = existing[0];
+
+      if (existingSources.length > 0) {
+        sourceId = existingSources[0];
       } else {
         sourceId = await new Promise((resolve, reject) => {
           objectClient.methodCall(
@@ -123,32 +110,33 @@ router.post("/create-lead", async (req, res) => {
               "create",
               [{ name: "Website" }],
             ],
-            (err, id) => (err ? reject(err) : resolve(id))
+            (err, value) => (err ? reject(err) : resolve(value))
           );
         });
       }
-    } catch (err) {
-      console.error("Source handling failed:", err);
+    } catch (sourceError) {
+      console.error("Source handling failed:", sourceError);
       throw new Error("Could not configure lead source");
     }
 
-    // Create CRM Lead
     const leadData = {
       name: `Website Lead - ${name}`,
       contact_name: name,
-      phone,
+      phone: phone,
       email_from: email,
       description: `Branch: ${branch}\nInquiry: ${inquiry}\nDetails: ${description}`,
+      // medium_id: 1,  // Only include if you have this configured
+      // team_id: 2,    // Only include if you have specific teams
     };
     const leadId = await new Promise((resolve, reject) => {
       objectClient.methodCall(
         "execute_kw",
         [ODOO_DB, uid, ODOO_PASSWORD, "crm.lead", "create", [leadData]],
-        (err, id) => (err ? reject(err) : resolve(id))
+        (err, value) => (err ? reject(err) : resolve(value))
       );
     });
 
-    // Subscribe followers
+    // Add followers (users via their partner IDs) without notifying them
     await new Promise((resolve, reject) => {
       objectClient.methodCall(
         "execute_kw",
@@ -158,89 +146,20 @@ router.post("/create-lead", async (req, res) => {
           ODOO_PASSWORD,
           "crm.lead",
           "message_subscribe",
-          [[leadId], DEFAULT_PARTNER_IDS],
-          { context: { mail_notify: false } },
+          [
+            [leadId], // Lead IDs array
+            DEFAULT_PARTNER_IDS, // Partner IDs array
+          ],
+          { context: { mail_notify: false } }, // Turn off notification
         ],
         (err, value) => (err ? reject(err) : resolve(value))
       );
     });
-
-    // Get 'To-do' activity type ID
-    const activityTypeId = await new Promise((resolve, reject) => {
-      objectClient.methodCall(
-        "execute_kw",
-        [
-          ODOO_DB,
-          uid,
-          ODOO_PASSWORD,
-          "mail.activity.type",
-          "search",
-          [[["name", "=", "To-do"]]],
-        ],
-        (err, value) => {
-          if (err) reject(err);
-          if (!value?.length)
-            reject(new Error("To-do activity type not found"));
-          resolve(value[0]);
-        }
-      );
-    });
-
-    // Create activities for each partner
-    for (const partnerId of DEFAULT_PARTNER_IDS) {
-      // Get user ID from partner ID
-      const [userId] = await new Promise((resolve, reject) => {
-        objectClient.methodCall(
-          "execute_kw",
-          [
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "res.users",
-            "search",
-            [[["partner_id", "=", partnerId]]],
-          ],
-          (err, value) => {
-            if (err) reject(err);
-            if (!value?.length)
-              reject(new Error(`User not found for partner ${partnerId}`));
-            resolve(value);
-          }
-        );
-      });
-
-      // Create activity
-      await new Promise((resolve, reject) => {
-        objectClient.methodCall(
-          "execute_kw",
-          [
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "mail.activity",
-            "create",
-            [
-              {
-                activity_type_id: activityTypeId,
-                summary: `New Lead: ${leadData.name}`,
-                note: `A new lead has been created. Contact: ${leadData.contact_name}, Phone: ${leadData.phone}`,
-                user_id: userId,
-                res_model: "crm.lead",
-                res_id: leadId,
-                date_deadline: formatOdooDateTime(new Date()),
-              },
-            ],
-          ],
-          (err, value) => (err ? reject(err) : resolve(value))
-        );
-      });
-    }
-
     res.json({
       success: true,
       leadId,
       sourceId,
-      message: "CRM lead created with follow-up activities",
+      message: "CRM lead created successfully",
     });
   } catch (error) {
     console.error("Error:", error);
@@ -251,7 +170,40 @@ router.post("/create-lead", async (req, res) => {
   }
 });
 
-// Existing create-meeting route unchanged
+module.exports = router;
+
+//     };
+
+//     // Create the lead in Odoo
+//     const leadId = await new Promise((resolve, reject) => {
+//       objectClient.methodCall(
+//         "execute_kw",
+//         [
+//           ODOO_DB,
+//           uid,
+//           ODOO_PASSWORD,
+//           "crm.lead", // Odoo model for leads
+//           "create",
+//           [leadData],
+//         ],
+//         (err, value) => (err ? reject(err) : resolve(value))
+//       );
+//     });
+
+//     res.json({
+//       success: true,
+//       leadId,
+//       message: "Lead created successfully",
+//     });
+//   } catch (error) {
+//     console.error("Error creating lead:", error);
+//     res.status(500).json({
+//       success: false,
+//       error: error.message || "Failed to create lead",
+//     });
+//   }
+// });
+
 router.post("/create-meeting", async (req, res) => {
   try {
     const { name, phone, appointmentDate, appointmentTime, branch, inquiry } =
@@ -277,13 +229,17 @@ router.post("/create-meeting", async (req, res) => {
               name: `${name}'s Appointment`,
               start: formatOdooDateTime(startDate),
               stop: formatOdooDateTime(endDate),
-              description: `Client Details:\n- Name: ${name}\n- Phone: ${phone}\n- Branch: ${branch}\n- Service: ${inquiry}`,
-              partner_ids: DEFAULT_PARTNER_IDS,
+              description: `Client Details:
+              - Name: ${name}
+              - Phone: ${phone}
+              - Branch: ${branch}
+              - Service: ${inquiry}`,
+              partner_ids: [9, 23, 1041, 1035],
               location: branch,
             },
           ],
         ],
-        (err, id) => (err ? reject(err) : resolve(id))
+        (err, value) => (err ? reject(err) : resolve(value))
       );
     });
 
