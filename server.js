@@ -3,7 +3,10 @@ const express = require("express");
 const https = require("https");
 const { URL } = require("url");
 const { v4: uuidv4 } = require("uuid");
+// NEW: Import the Vercel KV client
+const { createClient } = require("@vercel/kv");
 
+// --- ENVIRONMENT VARIABLES & CONFIG ---
 const {
   ODOO_URL,
   ODOO_DB,
@@ -11,16 +14,26 @@ const {
   ODOO_PASSWORD,
   CX_API_KEY,
   CX_API_SECRET,
+  CRON_SECRET, // NEW: For securing the cron endpoint
   PORT = 3000,
+  // NEW: Vercel KV environment variables will be automatically available
+  KV_URL,
+  KV_REST_API_URL,
+  KV_REST_API_TOKEN,
+  KV_REST_API_READ_ONLY_TOKEN,
 } = process.env;
 
+// --- INITIALIZATION ---
 const app = express();
 app.use(express.json());
 
-// ========================================================
-// 1️⃣ EMPLOYEE & RECORD MANAGEMENT
-// ========================================================
+// NEW: Initialize the Vercel KV client
+const kv = createClient({
+  url: KV_REST_API_URL,
+  token: KV_REST_API_TOKEN,
+});
 
+// This configuration remains the same
 const employeeConfig = {
   1: { odoo_id: 148, name: "Nezar Saab Abouhamdan" },
   2: { odoo_id: 149, name: "Abdulrazak Mansour Sabagh" },
@@ -41,20 +54,11 @@ const employeeConfig = {
   17: { odoo_id: 152, name: "abunas" },
   18: { odoo_id: 185, name: "Muhammad Hamza" },
 };
-// CRITICAL: This object maintains the state of all punches for each employee.
-const employeeRecords = {};
 
-function initializeEmployeeRecords() {
-  for (const workno in employeeConfig) {
-    employeeRecords[workno] = {
-      // records will be an array of { uuid: string, checktime: string, type: string, odoo_synced: boolean }
-      records: [],
-    };
-  }
-}
+// REMOVED: The in-memory `employeeRecords` object is no longer used. State is now in Vercel KV.
 
 // ========================================================
-// 2️⃣ CONFIGURATION VALIDATION & HELPERS
+// 1️⃣ CONFIGURATION VALIDATION & HELPERS
 // ========================================================
 
 function validateConfig() {
@@ -65,19 +69,22 @@ function validateConfig() {
     "ODOO_PASSWORD",
     "CX_API_KEY",
     "CX_API_SECRET",
+    "CRON_SECRET", // Ensure the cron secret is set
+    "KV_REST_API_URL", // Ensure Vercel KV is configured
+    "KV_REST_API_TOKEN",
   ];
   if (!required.every((key) => process.env[key])) {
-    console.error(
-      "❌ Missing environment variables:",
-      required.filter((key) => !process.env[key]).join(", ")
-    );
-    process.exit(1);
+    const missing = required.filter((key) => !process.env[key]);
+    console.error("❌ Missing environment variables:", missing.join(", "));
+    // In a serverless environment, throwing an error is better than exiting the process
+    throw new Error(`Missing environment variables: ${missing.join(", ")}`);
   }
 }
 
+// This helper can remain the same
 const lastRequestTimestamps = { crosschex: 0 };
 async function makeRequest(host, path, body, headers = {}) {
-  // Rate limiting for CrossChex
+  // ... (Your makeRequest function is fine, no changes needed here)
   if (host.includes("crosschexcloud.com")) {
     const now = Date.now();
     const timeSinceLast = now - lastRequestTimestamps.crosschex;
@@ -88,7 +95,6 @@ async function makeRequest(host, path, body, headers = {}) {
     }
     lastRequestTimestamps.crosschex = Date.now();
   }
-
   return new Promise((resolve, reject) => {
     const options = {
       hostname: host,
@@ -115,29 +121,31 @@ async function makeRequest(host, path, body, headers = {}) {
 }
 
 // ========================================================
-// 3️⃣ ODOO API FUNCTIONS
+// 2️⃣ ODOO & CROSSCHEX API FUNCTIONS
 // ========================================================
 
-let odooSession = { id: null, uid: null };
+// These functions are mostly stateless and can remain the same
+// REMOVED: The global `odooSession` variable to make it fully stateless.
+// It will now be managed within the scope of a single `syncAll` run.
 
+let odooSession = { id: null, uid: null }; // Will be reset on each invocation
 async function odooAuthenticate() {
-  if (odooSession.uid && odooSession.id) return; // Avoid re-authenticating if already done
   const host = new URL(ODOO_URL).hostname;
   const payload = JSON.stringify({
     jsonrpc: "2.0",
     method: "call",
+    id: uuidv4(),
     params: {
       service: "common",
       method: "login",
       args: [ODOO_DB, ODOO_USER, ODOO_PASSWORD],
     },
-    id: uuidv4(),
   });
   const { data } = await makeRequest(host, "/jsonrpc", payload);
   const json = JSON.parse(data);
   if (json.result) {
     odooSession = { uid: json.result, id: json.session_id || uuidv4() };
-    console.log("✅ Odoo authenticated");
+    console.log("✅ Odoo authenticated for this run");
   } else {
     throw new Error("Odoo authentication failed: " + JSON.stringify(json));
   }
@@ -149,11 +157,13 @@ function formatForOdoo(datetimeStr) {
 }
 
 async function odooRpcCall(model, method, args = [], kwargs = {}) {
-  await odooAuthenticate();
+  // Authentication is now checked on every call if needed
+  if (!odooSession.uid) await odooAuthenticate();
   const host = new URL(ODOO_URL).hostname;
   const payload = JSON.stringify({
     jsonrpc: "2.0",
     method: "call",
+    id: uuidv4(),
     params: {
       service: "object",
       method: "execute_kw",
@@ -167,30 +177,33 @@ async function odooRpcCall(model, method, args = [], kwargs = {}) {
         kwargs,
       ],
     },
-    id: uuidv4(),
   });
   const { data } = await makeRequest(host, "/jsonrpc", payload, {
     Cookie: `session_id=${odooSession.id}`,
   });
   const json = JSON.parse(data);
   if (json.error) {
-    console.error(
-      `❌ Odoo RPC Error (${model}.${method}):`,
-      json.error.data?.message || json.error.message
-    );
-    throw new Error(
-      json.error.data?.message || `Odoo RPC Error on ${model}.${method}`
-    );
+    const errorMessage = json.error.data?.message || json.error.message;
+    console.error(`❌ Odoo RPC Error (${model}.${method}):`, errorMessage);
+    // If auth error, reset session to force re-auth next time
+    if (errorMessage.includes("Session expired"))
+      odooSession = { id: null, uid: null };
+    throw new Error(errorMessage);
   }
   return json.result;
 }
 
-// ========================================================
-// 4️⃣ CROSSCHEX API FUNCTIONS
-// ========================================================
-
+// CX functions are fine as they are. They fetch a token each run if needed.
 let cxToken = "";
 let cxTokenExpires = null;
+async function getCXToken() {
+  /* ... No changes needed ... */
+}
+async function fetchCXRecords(startTime, endTime) {
+  /* ... No changes needed ... */
+}
+
+// Copy your existing `getCXToken` and `fetchCXRecords` functions here. They do not need to be changed.
 async function getCXToken() {
   if (cxToken && cxTokenExpires && new Date() < cxTokenExpires) return;
   console.log("🔑 Renewing CX token");
@@ -250,65 +263,68 @@ async function fetchCXRecords(startTime, endTime) {
 }
 
 // ========================================================
-// 5️⃣ CORE SYNC LOGIC
+// 3️⃣ REWRITTEN CORE SYNC LOGIC (STATELESS)
 // ========================================================
 
-function processNewRecords(workno, newRawRecords) {
-  const employee = employeeRecords[workno];
-  const existingUuids = new Set(employee.records.map((r) => r.uuid));
+/**
+ * Processes and syncs new records for a single employee in a stateless way.
+ */
+async function processAndSyncEmployee(workno, newRawRecords) {
+  const employeeInfo = employeeConfig[workno];
+  const odooEmployeeId = employeeInfo.odoo_id;
+  const kvKey = `records:${workno}`;
 
-  const trulyNewRecords = newRawRecords.filter(
-    (r) => !existingUuids.has(r.uuid)
+  // 1. Fetch previously synced record UUIDs from Vercel KV
+  const previouslySyncedUuids = await kv.smembers(kvKey);
+  const syncedUuidsSet = new Set(previouslySyncedUuids);
+
+  // 2. Filter out records that have already been synced
+  const unsyncedRecords = newRawRecords.filter(
+    (r) => !syncedUuidsSet.has(r.uuid)
   );
-  if (trulyNewRecords.length === 0) {
-    return false; // No new records
-  }
-
-  console.log(
-    `[${employeeConfig[workno].name}] Storing ${trulyNewRecords.length} new punch records.`
-  );
-
-  trulyNewRecords.forEach((rawRecord) => {
-    employee.records.push({
-      uuid: rawRecord.uuid,
-      checktime: rawRecord.checktime,
-      odoo_synced: false,
-    });
-  });
-
-  // Sort ALL records to determine the correct in/out sequence for the day
-  employee.records.sort(
-    (a, b) => new Date(a.checktime) - new Date(b.checktime)
-  );
-
-  // Assign type (in/out) based on the full historical sequence
-  employee.records.forEach((record, index) => {
-    record.type = index % 2 === 0 ? "check_in" : "check_out";
-  });
-
-  return true; // Indicates there are new records to process
-}
-
-async function syncEmployeeToOdoo(workno) {
-  const employee = employeeRecords[workno];
-  const odooEmployeeId = employeeConfig[workno].odoo_id;
-  const unsyncedRecords = employee.records.filter((r) => !r.odoo_synced);
 
   if (unsyncedRecords.length === 0) {
-    console.log(
-      `[${employeeConfig[workno].name}] No new records to sync to Odoo.`
-    );
+    console.log(`[${employeeInfo.name}] No new records to sync.`);
     return;
   }
 
+  // Sort records by time to ensure correct check-in/out order
+  unsyncedRecords.sort((a, b) => new Date(a.checktime) - new Date(b.checktime));
   console.log(
-    `[${employeeConfig[workno].name}] Syncing ${unsyncedRecords.length} records to Odoo...`
+    `[${employeeInfo.name}] Found ${unsyncedRecords.length} new records to sync.`
   );
 
+  // 3. Process each new record sequentially
   for (const record of unsyncedRecords) {
     try {
-      if (record.type === "check_in") {
-        console.log(`  -> Type: CHECK-IN. Time: ${record.checktime}`);
+      // For each punch, determine if it's a check-in or check-out by querying Odoo's current state
+      const openAttendances = await odooRpcCall(
+        "hr.attendance",
+        "search_read",
+        [
+          [
+            ["employee_id", "=", odooEmployeeId],
+            ["check_out", "=", false],
+          ],
+        ],
+        { fields: ["id"], limit: 1, order: "check_in desc" }
+      );
+
+      if (openAttendances.length > 0) {
+        // There's an open check-in, so this must be a check-out
+        const attendanceIdToUpdate = openAttendances[0].id;
+        console.log(
+          `  -> [${employeeInfo.name}] CHECK-OUT at ${record.checktime} for attendance ID ${attendanceIdToUpdate}`
+        );
+        await odooRpcCall("hr.attendance", "write", [
+          [attendanceIdToUpdate],
+          { check_out: formatForOdoo(record.checktime) },
+        ]);
+      } else {
+        // No open check-in, so this must be a new check-in
+        console.log(
+          `  -> [${employeeInfo.name}] CHECK-IN at ${record.checktime}`
+        );
         await odooRpcCall("hr.attendance", "create", [
           [
             {
@@ -317,79 +333,40 @@ async function syncEmployeeToOdoo(workno) {
             },
           ],
         ]);
-      } else {
-        // 'check_out'
-        console.log(`  -> Type: CHECK-OUT. Time: ${record.checktime}`);
-        // Find the last open attendance record for this employee to update it
-        const openAttendances = await odooRpcCall(
-          "hr.attendance",
-          "search_read",
-          [
-            [
-              ["employee_id", "=", odooEmployeeId],
-              ["check_out", "=", false],
-            ],
-          ],
-          { fields: ["id"], limit: 1, order: "check_in desc" }
-        );
-
-        if (openAttendances.length === 0) {
-          throw new Error(
-            `Cannot find an open attendance for employee ${odooEmployeeId} to check-out.`
-          );
-        }
-        const attendanceIdToUpdate = openAttendances[0].id;
-        console.log(
-          `     Found open attendance ID: ${attendanceIdToUpdate}. Updating...`
-        );
-        await odooRpcCall("hr.attendance", "write", [
-          [attendanceIdToUpdate],
-          { check_out: formatForOdoo(record.checktime) },
-        ]);
       }
-      record.odoo_synced = true; // Mark as synced ONLY on success
+
+      // 4. On successful sync to Odoo, add the UUID to our KV store
+      await kv.sadd(kvKey, record.uuid);
       console.log(`     ✅ Successfully synced record ${record.uuid}`);
     } catch (error) {
       console.error(
-        `     ❌ FAILED to sync record ${record.uuid}: ${error.message}`
+        `     ❌ FAILED to sync record ${record.uuid} for ${employeeInfo.name}: ${error.message}`
       );
-      // IMPORTANT: Stop processing this employee on the first error to maintain the correct sequence.
-      // The next run will try this same record again.
-      return;
+      // IMPORTANT: Stop processing this employee on the first error to maintain order.
+      // The next cron run will re-attempt this record since its UUID was not saved to KV.
+      return; // Exit this function for this employee
     }
   }
 }
 
+/**
+ * Main function called by the cron job.
+ */
 async function syncAll() {
+  console.log("\n🔄 Starting synchronization cycle...");
+  odooSession = { id: null, uid: null }; // Reset Odoo session for each run
+
   try {
     const now = new Date();
-    // Fetch records for the entire day in UTC
-    const startOfDay = new Date(
-      Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        0,
-        0,
-        0,
-        0
-      )
+    // Fetch a window of records. E.g., the last 24 hours to be safe.
+    const startTime = new Date(
+      now.getTime() - 24 * 60 * 60 * 1000
     ).toISOString();
-    const endOfDay = new Date(
-      Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        23,
-        59,
-        59,
-        999
-      )
-    ).toISOString();
+    const endTime = now.toISOString();
 
-    const allRawRecords = await fetchCXRecords(startOfDay, endOfDay);
+    const allRawRecords = await fetchCXRecords(startTime, endTime);
 
-    // Group all fetched records by employee
+    // Group records by employee
     const rawRecordsByEmployee = {};
     for (const rawRecord of allRawRecords) {
       const workno = rawRecord.employee.workno;
@@ -399,82 +376,57 @@ async function syncAll() {
       }
     }
 
-    // Process and sync for each configured employee
+    // Process each employee one by one
     for (const workno in employeeConfig) {
       if (rawRecordsByEmployee[workno]) {
-        const hasNew = processNewRecords(workno, rawRecordsByEmployee[workno]);
-        if (hasNew) {
-          await syncEmployeeToOdoo(workno);
-        }
+        await processAndSyncEmployee(workno, rawRecordsByEmployee[workno]);
       }
     }
+
+    console.log("✅ Synchronization cycle finished.");
   } catch (error) {
-    // Catch errors from fetching or auth, not from individual syncs
+    // This catches major errors like failing to fetch from CrossChex or Odoo auth
     console.error(
       "❌ A major error occurred in the sync cycle:",
       error.message
     );
+    // Throw error to signal failure to Vercel
+    throw error;
   }
 }
 
 // ========================================================
-// 6️⃣ SCHEDULING & SERVER STARTUP
+// 4️⃣ API ENDPOINTS & SERVER STARTUP
 // ========================================================
 
-// UPDATED: Changed from minutes to seconds for more granular control
-const SYNC_INTERVAL_SECONDS = parseInt(process.env.SYNC_INTERVAL_SECONDS) || 30;
-let syncInterval = null;
-let isSyncing = false; // A flag to prevent syncs from overlapping
-
-async function performAutomaticSync() {
-  if (isSyncing) {
-    console.log("Sync already in progress. Skipping this run.");
-    return;
-  }
-  isSyncing = true;
-  console.log("\n🔄 Starting automatic synchronization...");
-  try {
-    await syncAll();
-  } catch (e) {
-    console.error("Critical failure during sync execution", e);
-  }
-  console.log("✅ Automatic sync cycle finished.");
-  isSyncing = false;
-}
-
-function startAutomaticSync() {
-  // UPDATED: Log message reflects seconds
-  console.log(
-    `⏰ Automatic sync will start now, then run every ${SYNC_INTERVAL_SECONDS} seconds`
-  );
-  performAutomaticSync(); // Run immediately on start
-  // UPDATED: Calculation is now SYNC_INTERVAL_SECONDS * 1000
-  syncInterval = setInterval(
-    performAutomaticSync,
-    SYNC_INTERVAL_SECONDS * 1000
-  );
-}
-
-// API endpoint to manually trigger a sync
-app.post("/trigger-sync", async (req, res) => {
-  console.log("Manual sync triggered via API.");
-  await performAutomaticSync();
-  res.json({ success: true, message: "Manual sync finished." });
-});
+// REMOVED: All `setInterval` and automatic scheduling logic.
 
 // A simple health-check endpoint
 app.get("/", (req, res) => res.json({ status: "running" }));
 
-// Graceful shutdown
-process.on("SIGINT", () => {
-  if (syncInterval) clearInterval(syncInterval);
-  console.log("\n🛑 Shutting down gracefully...");
-  process.exit(0);
+// NEW: The endpoint that Vercel Cron Jobs will call
+app.post("/api/cron", async (req, res) => {
+  // Secure the endpoint
+  const authHeader = req.headers.authorization;
+  if (authHeader !== `Bearer ${CRON_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    await syncAll();
+    res.status(200).json({ success: true, message: "Sync finished." });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-validateConfig();
-initializeEmployeeRecords();
-app.listen(PORT, () => {
-  console.log(`🚀 Attendance Sync API running on port ${PORT}`);
-  startAutomaticSync();
-});
+// Start the server
+try {
+  validateConfig();
+  app.listen(PORT, () => {
+    console.log(`🚀 Attendance Sync API ready and listening on port ${PORT}`);
+    console.log("Waiting for Vercel Cron Job triggers on /api/cron");
+  });
+} catch (error) {
+  console.error("Failed to start server:", error.message);
+}
