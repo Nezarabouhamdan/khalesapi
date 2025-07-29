@@ -1,0 +1,58 @@
+{
+  "1": {
+    "records": [
+      {
+        "uuid": "a0f29f307df41d1daf9ab60dd6f69c22d483b779174e45dbbd0b503c16494932",
+        "checktime": "2025-06-19T04:30:00+00:00",
+        "odoo_synced": false,
+        "type": "check_in"
+      },
+      {
+        "uuid": "32f4cfa69cabc5c792875e33e3d5ca45e0d19f74566f1b5e52c8afc214fbef04",
+        "checktime": "2025-06-19T05:07:00+00:00",
+        "odoo_synced": true,
+        "type": "check_out"
+      },
+      {
+        "uuid": "99ed8c0e0a024d155656359812379d2d6bdb79e21aae2ac4e463d96877f01c9c",
+        "checktime": "2025-06-19T06:08:00+00:00",
+        "odoo_synced": true,
+        "type": "check_in"
+      },
+      {
+        "uuid": "78dff5f51d329b0341fb3ec2c4dde796c03707a18ef2ea563f4d52f3a04ac30b",
+        "checktime": "2025-06-19T07:12:00+00:00",
+        "odoo_synced": true,
+        "type": "check_out"
+      }
+    ]
+  },
+  "2": {
+    "records": [
+      {
+        "uuid": "bb2062f383252778beabd9e2636e34a8c94125dd4eeb7a264e16e379406ab2ad",
+        "checktime": "2025-06-19T04:30:00+00:00",
+        "odoo_synced": false,
+        "type": "check_in"
+      },
+      {
+        "uuid": "4788fde57da3025f09b374431fc2848a5ec48eb751bdf2f64cb830fb0fc8a75d",
+        "checktime": "2025-06-19T05:07:00+00:00",
+        "odoo_synced": true,
+        "type": "check_out"
+      },
+      {
+        "uuid": "764d679b22516e1bd73025ca7670527666f14e6a61a2bb362377b9cc2dde9c40",
+        "checktime": "2025-06-19T06:08:00+00:00",
+        "odoo_synced": true,
+        "type": "check_in"
+      },
+      {
+        "uuid": "ea91dfa3fd4845d99197b644cf1d77593088ae1c7ea22ef7f853c2996eabf68b",
+        "checktime": "2025-06-19T07:12:00+00:00",
+        "odoo_synced": true,
+        "type": "check_out"
+      }
+    ]
+  }
+}
