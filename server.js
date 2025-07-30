@@ -3,11 +3,13 @@ const express = require("express");
 const https = require("https");
 const { URL } = require("url");
 const { v4: uuidv4 } = require("uuid");
-const {
-  zonedTimeToUtc,
-  startOfDay: startOfDayTz,
-  endOfDay: endOfDayTz,
-} = require("date-fns-tz");
+
+// ▼▼▼ NEW: Add the dayjs library and its required plugins for timezone handling ▼▼▼
+const dayjs = require("dayjs");
+const utc = require("dayjs/plugin/utc");
+const timezone = require("dayjs/plugin/timezone");
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 const {
   ODOO_URL,
@@ -23,7 +25,7 @@ const app = express();
 app.use(express.json());
 
 // ========================================================
-// 1️⃣ EMPLOYEE & RECORD MANAGEMENT
+// 1️⃣ EMPLOYEE & RECORD MANAGEMENT (Original)
 // ========================================================
 
 const employeeConfig = {
@@ -46,20 +48,18 @@ const employeeConfig = {
   17: { odoo_id: 152, name: "abunas" },
   18: { odoo_id: 185, name: "Muhammad Hamza" },
 };
-// CRITICAL: This object maintains the state of all punches for each employee.
 const employeeRecords = {};
 
 function initializeEmployeeRecords() {
   for (const workno in employeeConfig) {
     employeeRecords[workno] = {
-      // records will be an array of { uuid: string, checktime: string, type: string, odoo_synced: boolean }
       records: [],
     };
   }
 }
 
 // ========================================================
-// 2️⃣ CONFIGURATION VALIDATION & HELPERS
+// 2️⃣ CONFIGURATION VALIDATION & HELPERS (Original)
 // ========================================================
 
 function validateConfig() {
@@ -82,7 +82,6 @@ function validateConfig() {
 
 const lastRequestTimestamps = { crosschex: 0 };
 async function makeRequest(host, path, body, headers = {}) {
-  // Rate limiting for CrossChex
   if (host.includes("crosschexcloud.com")) {
     const now = Date.now();
     const timeSinceLast = now - lastRequestTimestamps.crosschex;
@@ -120,13 +119,13 @@ async function makeRequest(host, path, body, headers = {}) {
 }
 
 // ========================================================
-// 3️⃣ ODOO API FUNCTIONS
+// 3️⃣ ODOO API FUNCTIONS (Original)
 // ========================================================
 
 let odooSession = { id: null, uid: null };
 
 async function odooAuthenticate() {
-  if (odooSession.uid && odooSession.id) return; // Avoid re-authenticating if already done
+  if (odooSession.uid && odooSession.id) return;
   const host = new URL(ODOO_URL).hostname;
   const payload = JSON.stringify({
     jsonrpc: "2.0",
@@ -191,7 +190,7 @@ async function odooRpcCall(model, method, args = [], kwargs = {}) {
 }
 
 // ========================================================
-// 4️⃣ CROSSCHEX API FUNCTIONS
+// 4️⃣ CROSSCHEX API FUNCTIONS (Original)
 // ========================================================
 
 let cxToken = "";
@@ -255,7 +254,7 @@ async function fetchCXRecords(startTime, endTime) {
 }
 
 // ========================================================
-// 5️⃣ CORE SYNC LOGIC
+// 5️⃣ CORE SYNC LOGIC (Original, except for syncAll)
 // ========================================================
 
 function processNewRecords(workno, newRawRecords) {
@@ -266,7 +265,7 @@ function processNewRecords(workno, newRawRecords) {
     (r) => !existingUuids.has(r.uuid)
   );
   if (trulyNewRecords.length === 0) {
-    return false; // No new records
+    return false;
   }
 
   console.log(
@@ -281,17 +280,15 @@ function processNewRecords(workno, newRawRecords) {
     });
   });
 
-  // Sort ALL records to determine the correct in/out sequence for the day
   employee.records.sort(
     (a, b) => new Date(a.checktime) - new Date(b.checktime)
   );
 
-  // Assign type (in/out) based on the full historical sequence
   employee.records.forEach((record, index) => {
     record.type = index % 2 === 0 ? "check_in" : "check_out";
   });
 
-  return true; // Indicates there are new records to process
+  return true;
 }
 
 async function syncEmployeeToOdoo(workno) {
@@ -300,9 +297,6 @@ async function syncEmployeeToOdoo(workno) {
   const unsyncedRecords = employee.records.filter((r) => !r.odoo_synced);
 
   if (unsyncedRecords.length === 0) {
-    console.log(
-      `[${employeeConfig[workno].name}] No new records to sync to Odoo.`
-    );
     return;
   }
 
@@ -323,9 +317,7 @@ async function syncEmployeeToOdoo(workno) {
           ],
         ]);
       } else {
-        // 'check_out'
         console.log(`  -> Type: CHECK-OUT. Time: ${record.checktime}`);
-        // Find the last open attendance record for this employee to update it
         const openAttendances = await odooRpcCall(
           "hr.attendance",
           "search_read",
@@ -352,39 +344,32 @@ async function syncEmployeeToOdoo(workno) {
           { check_out: formatForOdoo(record.checktime) },
         ]);
       }
-      record.odoo_synced = true; // Mark as synced ONLY on success
+      record.odoo_synced = true;
       console.log(`     ✅ Successfully synced record ${record.uuid}`);
     } catch (error) {
       console.error(
         `     ❌ FAILED to sync record ${record.uuid}: ${error.message}`
       );
-      // IMPORTANT: Stop processing this employee on the first error to maintain the correct sequence.
-      // The next run will try this same record again.
       return;
     }
   }
 }
 
+// ▼▼▼ CORRECTED: This function now reliably calculates the Dubai day ▼▼▼
 async function syncAll() {
   try {
-    // Define the target timezone
     const timeZone = "Asia/Dubai";
 
-    // Get the current date/time in a way that's aware of the target timezone
-    const nowInDubai = zonedTimeToUtc(new Date(), timeZone);
+    // Get the start and end of the current day in the Dubai timezone
+    const startOfDayInDubai = dayjs().tz(timeZone).startOf("day");
+    const endOfDayInDubai = dayjs().tz(timeZone).endOf("day");
 
-    // Calculate the start and end of the DAY in the Dubai timezone
-    const startOfDubaiDay = startOfDayTz(nowInDubai, { timeZone });
-    const endOfDubaiDay = endOfDayTz(nowInDubai, { timeZone });
+    // Convert to the ISO string format which is in UTC, as required by the API
+    const startTime = startOfDayInDubai.toISOString();
+    const endTime = endOfDayInDubai.toISOString();
 
-    // Convert to ISO string format for the API call
-    const startTime = startOfDubaiDay.toISOString();
-    const endTime = endOfDubaiDay.toISOString();
-
-    // The rest of your function remains the same
     const allRawRecords = await fetchCXRecords(startTime, endTime);
 
-    // Group all fetched records by employee
     const rawRecordsByEmployee = {};
     for (const rawRecord of allRawRecords) {
       const workno = rawRecord.employee.workno;
@@ -394,7 +379,6 @@ async function syncAll() {
       }
     }
 
-    // Process and sync for each configured employee
     for (const workno in employeeConfig) {
       if (rawRecordsByEmployee[workno]) {
         const hasNew = processNewRecords(workno, rawRecordsByEmployee[workno]);
@@ -404,21 +388,20 @@ async function syncAll() {
       }
     }
   } catch (error) {
-    // Catch errors from fetching or auth, not from individual syncs
     console.error(
       "❌ A major error occurred in the sync cycle:",
       error.message
     );
   }
 }
+
 // ========================================================
-// 6️⃣ SCHEDULING & SERVER STARTUP
+// 6️⃣ SCHEDULING & SERVER STARTUP (Original)
 // ========================================================
 
-// UPDATED: Changed from minutes to seconds for more granular control
 const SYNC_INTERVAL_SECONDS = parseInt(process.env.SYNC_INTERVAL_SECONDS) || 30;
 let syncInterval = null;
-let isSyncing = false; // A flag to prevent syncs from overlapping
+let isSyncing = false;
 
 async function performAutomaticSync() {
   if (isSyncing) {
@@ -437,29 +420,24 @@ async function performAutomaticSync() {
 }
 
 function startAutomaticSync() {
-  // UPDATED: Log message reflects seconds
   console.log(
     `⏰ Automatic sync will start now, then run every ${SYNC_INTERVAL_SECONDS} seconds`
   );
-  performAutomaticSync(); // Run immediately on start
-  // UPDATED: Calculation is now SYNC_INTERVAL_SECONDS * 1000
+  performAutomaticSync();
   syncInterval = setInterval(
     performAutomaticSync,
     SYNC_INTERVAL_SECONDS * 1000
   );
 }
 
-// API endpoint to manually trigger a sync
 app.post("/trigger-sync", async (req, res) => {
   console.log("Manual sync triggered via API.");
   await performAutomaticSync();
   res.json({ success: true, message: "Manual sync finished." });
 });
 
-// A simple health-check endpoint
 app.get("/", (req, res) => res.json({ status: "running" }));
 
-// Graceful shutdown
 process.on("SIGINT", () => {
   if (syncInterval) clearInterval(syncInterval);
   console.log("\n🛑 Shutting down gracefully...");
