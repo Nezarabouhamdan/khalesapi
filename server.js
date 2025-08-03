@@ -4,7 +4,7 @@ const https = require("https");
 const { URL } = require("url");
 const { v4: uuidv4 } = require("uuid");
 
-// ▼▼▼ NEW: Add the dayjs library and its required plugins for timezone handling ▼▼▼
+// Use dayjs for robust time and timezone handling
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
@@ -25,9 +25,8 @@ const app = express();
 app.use(express.json());
 
 // ========================================================
-// 1️⃣ EMPLOYEE & RECORD MANAGEMENT (Original)
+// 1️⃣ EMPLOYEE CONFIGURATION
 // ========================================================
-
 const employeeConfig = {
   1: { odoo_id: 148, name: "Nezar Saab Abouhamdan" },
   2: { odoo_id: 149, name: "Abdulrazak Mansour Sabagh" },
@@ -48,20 +47,10 @@ const employeeConfig = {
   17: { odoo_id: 152, name: "abunas" },
   18: { odoo_id: 185, name: "Muhammad Hamza" },
 };
-const employeeRecords = {};
-
-function initializeEmployeeRecords() {
-  for (const workno in employeeConfig) {
-    employeeRecords[workno] = {
-      records: [],
-    };
-  }
-}
 
 // ========================================================
-// 2️⃣ CONFIGURATION VALIDATION & HELPERS (Original)
+// 2️⃣ HELPER & API FUNCTIONS (Odoo, CrossChex)
 // ========================================================
-
 function validateConfig() {
   const required = [
     "ODOO_URL",
@@ -85,14 +74,14 @@ async function makeRequest(host, path, body, headers = {}) {
   if (host.includes("crosschexcloud.com")) {
     const now = Date.now();
     const timeSinceLast = now - lastRequestTimestamps.crosschex;
-    if (timeSinceLast < 31000) {
-      const waitTime = 31000 - timeSinceLast;
+    if (timeSinceLast < 5000) {
+      // 5 second buffer
+      const waitTime = 5000 - timeSinceLast;
       console.log(`⏳ Waiting ${waitTime / 1000}s for CrossChex rate limit`);
       await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
     lastRequestTimestamps.crosschex = Date.now();
   }
-
   return new Promise((resolve, reject) => {
     const options = {
       hostname: host,
@@ -118,12 +107,7 @@ async function makeRequest(host, path, body, headers = {}) {
   });
 }
 
-// ========================================================
-// 3️⃣ ODOO API FUNCTIONS (Original)
-// ========================================================
-
 let odooSession = { id: null, uid: null };
-
 async function odooAuthenticate() {
   if (odooSession.uid && odooSession.id) return;
   const host = new URL(ODOO_URL).hostname;
@@ -147,9 +131,8 @@ async function odooAuthenticate() {
   }
 }
 
-function formatForOdoo(datetimeStr) {
-  const date = new Date(datetimeStr);
-  return date.toISOString().replace("T", " ").substring(0, 19);
+function formatForOdoo(datetime) {
+  return dayjs(datetime).utc().format("YYYY-MM-DD HH:mm:ss");
 }
 
 async function odooRpcCall(model, method, args = [], kwargs = {}) {
@@ -188,10 +171,6 @@ async function odooRpcCall(model, method, args = [], kwargs = {}) {
   }
   return json.result;
 }
-
-// ========================================================
-// 4️⃣ CROSSCHEX API FUNCTIONS (Original)
-// ========================================================
 
 let cxToken = "";
 let cxTokenExpires = null;
@@ -254,174 +233,141 @@ async function fetchCXRecords(startTime, endTime) {
 }
 
 // ========================================================
-// 5️⃣ CORE SYNC LOGIC (Original, except for syncAll)
+// 3️⃣ CORE SYNC LOGIC (STATELESS & RELIABLE)
 // ========================================================
+async function syncEmployee(workno, punches, startOfDay, endOfDay) {
+  const { odoo_id: employeeId, name: employeeName } = employeeConfig[workno];
+  console.log(`[${employeeName}] Reconciling ${punches.length} punches...`);
 
-function processNewRecords(workno, newRawRecords) {
-  const employee = employeeRecords[workno];
-  const existingUuids = new Set(employee.records.map((r) => r.uuid));
-
-  const trulyNewRecords = newRawRecords.filter(
-    (r) => !existingUuids.has(r.uuid)
-  );
-  if (trulyNewRecords.length === 0) {
-    return false;
-  }
-
-  console.log(
-    `[${employeeConfig[workno].name}] Storing ${trulyNewRecords.length} new punch records.`
-  );
-
-  trulyNewRecords.forEach((rawRecord) => {
-    employee.records.push({
-      uuid: rawRecord.uuid,
-      checktime: rawRecord.checktime,
-      odoo_synced: false,
-    });
-  });
-
-  employee.records.sort(
-    (a, b) => new Date(a.checktime) - new Date(b.checktime)
+  // 1. Get Odoo records for this employee for the current day
+  const odooAttendances = await odooRpcCall(
+    "hr.attendance",
+    "search_read",
+    [
+      [
+        ["employee_id", "=", employeeId],
+        ["check_in", ">=", formatForOdoo(startOfDay)],
+        ["check_in", "<=", formatForOdoo(endOfDay)],
+      ],
+    ],
+    { fields: ["id", "check_in", "check_out"], order: "check_in asc" }
   );
 
-  employee.records.forEach((record, index) => {
-    record.type = index % 2 === 0 ? "check_in" : "check_out";
-  });
+  // 2. Loop through the punches in pairs (check-in, check-out)
+  for (let i = 0; i < punches.length; i += 2) {
+    const checkInPunch = punches[i];
+    const checkOutPunch = punches[i + 1]; // This will be undefined if there's an odd number of punches
 
-  return true;
-}
+    const odooRecord = odooAttendances[i / 2];
 
-async function syncEmployeeToOdoo(workno) {
-  const employee = employeeRecords[workno];
-  const odooEmployeeId = employeeConfig[workno].odoo_id;
-  const unsyncedRecords = employee.records.filter((r) => !r.odoo_synced);
-
-  if (unsyncedRecords.length === 0) {
-    return;
-  }
-
-  console.log(
-    `[${employeeConfig[workno].name}] Syncing ${unsyncedRecords.length} records to Odoo...`
-  );
-
-  for (const record of unsyncedRecords) {
-    try {
-      if (record.type === "check_in") {
-        console.log(`  -> Type: CHECK-IN. Time: ${record.checktime}`);
-        await odooRpcCall("hr.attendance", "create", [
-          [
-            {
-              employee_id: odooEmployeeId,
-              check_in: formatForOdoo(record.checktime),
-            },
-          ],
-        ]);
-      } else {
-        console.log(`  -> Type: CHECK-OUT. Time: ${record.checktime}`);
-        const openAttendances = await odooRpcCall(
-          "hr.attendance",
-          "search_read",
-          [
-            [
-              ["employee_id", "=", odooEmployeeId],
-              ["check_out", "=", false],
-            ],
-          ],
-          { fields: ["id"], limit: 1, order: "check_in desc" }
-        );
-
-        if (openAttendances.length === 0) {
-          throw new Error(
-            `Cannot find an open attendance for employee ${odooEmployeeId} to check-out.`
-          );
-        }
-        const attendanceIdToUpdate = openAttendances[0].id;
+    if (!odooRecord) {
+      // If there's no corresponding record in Odoo, we need to create it.
+      console.log(
+        `  -> Creating new Odoo record for check-in at ${checkInPunch.checktime}`
+      );
+      const newRecordPayload = {
+        employee_id: employeeId,
+        check_in: formatForOdoo(checkInPunch.checktime),
+      };
+      if (checkOutPunch) {
+        // If there's a matching check-out punch, add it to the new record right away.
+        newRecordPayload.check_out = formatForOdoo(checkOutPunch.checktime);
+        console.log(`     ... with check-out at ${checkOutPunch.checktime}`);
+      }
+      await odooRpcCall("hr.attendance", "create", [newRecordPayload]);
+    } else {
+      // A record already exists in Odoo. We only need to act if there's a new check-out.
+      if (checkOutPunch && !odooRecord.check_out) {
+        // If there is a checkout punch and the Odoo record is still open, update it.
         console.log(
-          `     Found open attendance ID: ${attendanceIdToUpdate}. Updating...`
+          `  -> Updating Odoo record [${odooRecord.id}] with check-out at ${checkOutPunch.checktime}`
         );
         await odooRpcCall("hr.attendance", "write", [
-          [attendanceIdToUpdate],
-          { check_out: formatForOdoo(record.checktime) },
+          [odooRecord.id],
+          { check_out: formatForOdoo(checkOutPunch.checktime) },
         ]);
       }
-      record.odoo_synced = true;
-      console.log(`     ✅ Successfully synced record ${record.uuid}`);
-    } catch (error) {
-      console.error(
-        `     ❌ FAILED to sync record ${record.uuid}: ${error.message}`
-      );
-      return;
     }
   }
 }
 
-// ▼▼▼ CORRECTED: This function now reliably calculates the Dubai day ▼▼▼
 async function syncAll() {
   try {
     const timeZone = "Asia/Dubai";
+    const nowInDubai = dayjs().tz(timeZone);
+    const startOfDay = nowInDubai.startOf("day");
+    const endOfDay = nowInDubai.endOf("day");
 
-    // Get the start and end of the current day in the Dubai timezone
-    const startOfDayInDubai = dayjs().tz(timeZone).startOf("day");
-    const endOfDayInDubai = dayjs().tz(timeZone).endOf("day");
+    // Fetch all records within the correct Dubai workday
+    let allCxRecords = await fetchCXRecords(
+      startOfDay.toISOString(),
+      endOfDay.toISOString()
+    );
 
-    // Convert to the ISO string format which is in UTC, as required by the API
-    const startTime = startOfDayInDubai.toISOString();
-    const endTime = endOfDayInDubai.toISOString();
+    // ▼▼▼ CRITICAL REQUIREMENT: Manually subtract 2 hours from every punch timestamp ▼▼▼
+    if (allCxRecords.length > 0) {
+      console.log(
+        `- Adjusting ${allCxRecords.length} raw records by -2 hours...`
+      );
+      allCxRecords = allCxRecords.map((record) => {
+        const originalTime = dayjs(record.checktime);
+        const adjustedTime = originalTime.subtract(2, "hour");
+        // Overwrite the original checktime with the adjusted one for all subsequent logic.
+        record.checktime = adjustedTime.toISOString();
+        return record;
+      });
+    }
+    // ▲▲▲ END OF ADJUSTMENT ▲▲▲
 
-    const allRawRecords = await fetchCXRecords(startTime, endTime);
-
-    const rawRecordsByEmployee = {};
-    for (const rawRecord of allRawRecords) {
-      const workno = rawRecord.employee.workno;
+    // Group the (now adjusted) punches by employee
+    const punchesByEmployee = {};
+    for (const record of allCxRecords) {
+      const workno = record.employee.workno;
       if (employeeConfig[workno]) {
-        if (!rawRecordsByEmployee[workno]) rawRecordsByEmployee[workno] = [];
-        rawRecordsByEmployee[workno].push(rawRecord);
+        if (!punchesByEmployee[workno]) punchesByEmployee[workno] = [];
+        punchesByEmployee[workno].push(record);
       }
     }
 
-    for (const workno in employeeConfig) {
-      if (rawRecordsByEmployee[workno]) {
-        const hasNew = processNewRecords(workno, rawRecordsByEmployee[workno]);
-        if (hasNew) {
-          await syncEmployeeToOdoo(workno);
-        }
-      }
+    // Process each employee's punches for the day
+    for (const workno in punchesByEmployee) {
+      // Sort the punches chronologically to ensure the correct order
+      const punches = punchesByEmployee[workno].sort(
+        (a, b) => new Date(a.checktime) - new Date(b.checktime)
+      );
+      await syncEmployee(workno, punches, startOfDay, endOfDay);
     }
   } catch (error) {
     console.error(
       "❌ A major error occurred in the sync cycle:",
-      error.message
+      error.message,
+      error.stack
     );
   }
 }
 
 // ========================================================
-// 6️⃣ SCHEDULING & SERVER STARTUP (Original)
+// 4️⃣ SCHEDULING & SERVER STARTUP
 // ========================================================
-
-const SYNC_INTERVAL_SECONDS = parseInt(process.env.SYNC_INTERVAL_SECONDS) || 30;
+const SYNC_INTERVAL_SECONDS = parseInt(process.env.SYNC_INTERVAL_SECONDS) || 60;
 let syncInterval = null;
 let isSyncing = false;
 
 async function performAutomaticSync() {
   if (isSyncing) {
-    console.log("Sync already in progress. Skipping this run.");
+    console.log("Sync already in progress. Skipping...");
     return;
   }
   isSyncing = true;
   console.log("\n🔄 Starting automatic synchronization...");
-  try {
-    await syncAll();
-  } catch (e) {
-    console.error("Critical failure during sync execution", e);
-  }
+  await syncAll();
   console.log("✅ Automatic sync cycle finished.");
   isSyncing = false;
 }
 
 function startAutomaticSync() {
   console.log(
-    `⏰ Automatic sync will start now, then run every ${SYNC_INTERVAL_SECONDS} seconds`
+    `⏰ Automatic sync starting now, then every ${SYNC_INTERVAL_SECONDS} seconds`
   );
   performAutomaticSync();
   syncInterval = setInterval(
@@ -436,6 +382,46 @@ app.post("/trigger-sync", async (req, res) => {
   res.json({ success: true, message: "Manual sync finished." });
 });
 
+app.post("/force-checkout-all", async (req, res) => {
+  console.log(
+    "🚨 MANUAL OVERRIDE: Forcing check-out for all stuck employees..."
+  );
+  try {
+    const openAttendances = await odooRpcCall(
+      "hr.attendance",
+      "search_read",
+      [[["check_out", "=", false]]],
+      { fields: ["id", "employee_id"] }
+    );
+    if (openAttendances.length === 0) {
+      console.log("✅ No stuck employees found.");
+      return res
+        .status(200)
+        .json({ success: true, message: "No open attendances found." });
+    }
+    console.log(`Found ${openAttendances.length} employees to check out.`);
+    const checkOutTime = formatForOdoo(new Date());
+    for (const attendance of openAttendances) {
+      await odooRpcCall("hr.attendance", "write", [
+        [attendance.id],
+        { check_out: checkOutTime },
+      ]);
+    }
+    console.log("✅ Force check-out process finished.");
+    res.status(200).json({
+      success: true,
+      message: `Successfully checked out ${openAttendances.length} employees.`,
+    });
+  } catch (error) {
+    console.error("❌ Error during force check-out:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "An error occurred.",
+      error: error.message,
+    });
+  }
+});
+
 app.get("/", (req, res) => res.json({ status: "running" }));
 
 process.on("SIGINT", () => {
@@ -445,7 +431,6 @@ process.on("SIGINT", () => {
 });
 
 validateConfig();
-initializeEmployeeRecords();
 app.listen(PORT, () => {
   console.log(`🚀 Attendance Sync API running on port ${PORT}`);
   startAutomaticSync();
